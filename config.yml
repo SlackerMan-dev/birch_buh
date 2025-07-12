@@ -1,0 +1,19 @@
+ingress:
+  - hostname: "*"
+    service: http://localhost:5000
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 30s
+      tlsTimeout: 30s
+      tcpKeepAlive: 30s
+      keepAliveConnections: 100
+      keepAliveTimeout: 90s
+      noHappyEyeballs: true
+  - service: http_status:404
+
+retries: 5
+grace-period: 30s
+protocol: h2mux
+compression-quality: 0
+edge-ip-version: 4
+metrics-update-freq: 5s

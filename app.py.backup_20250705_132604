@@ -1,0 +1,855 @@
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+from datetime import datetime, timedelta
+import json
+from decimal import Decimal
+import os
+from werkzeug.utils import secure_filename
+from sqlalchemy import func
+from utils import (
+    find_prev_balance,
+    calculate_report_profit,
+    calculate_account_last_balance,
+    group_reports_by_day_net_profit
+)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///arbitrage_reports.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+
+db = SQLAlchemy(app)
+CORS(app)
+
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+ALLOWED_EXTENSIONS = {'csv', 'xlsx', 'xls', 'png', 'jpg', 'jpeg', 'webp', 'pdf', 'txt'}
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def validate_file_size(file):
+    """Дополнительная проверка размера файла"""
+    if file and hasattr(file, 'content_length') and file.content_length:
+        return file.content_length <= app.config['MAX_CONTENT_LENGTH']
+    return True
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+# --- КОНСТАНТЫ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+PLATFORMS = ['bybit', 'htx', 'bliss', 'gate']
+ADMIN_PASSWORD = 'Blalala2'
+
+def validate_admin_password(data):
+    """Проверяет пароль администратора"""
+    if not data or not data.get('password'):
+        return False
+    # Используем переменную окружения для пароля администратора
+    admin_password = os.environ.get('ADMIN_PASSWORD', 'Blalala2')
+    return data['password'] == admin_password
+
+# Модели данных
+class Employee(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    telegram = db.Column(db.String(100), nullable=True)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    salary_percent = db.Column(db.Float, nullable=True)  # Новый процент для расчёта зарплаты
+
+class Account(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=True)
+    platform = db.Column(db.String(20), nullable=False)  # bybit, htx, bliss, gate
+    account_name = db.Column(db.String(100), nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+
+class ShiftReport(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
+    shift_date = db.Column(db.Date, nullable=False)
+    shift_type = db.Column(db.String(20), nullable=False)  # 'morning' или 'evening'
+    total_requests = db.Column(db.Integer, default=0)  # всего заявок обработано
+    # Балансы по аккаунтам (json: {"bybit": [{"account_id": 1, "balance": 123.45}, ...], ...})
+    balances_json = db.Column(db.Text, nullable=False, default='{}')
+    # СКАМ
+    scam_amount = db.Column(db.Numeric(15, 2), default=0)
+    scam_comment = db.Column(db.Text, default='')
+    scam_personal = db.Column(db.Boolean, default=False)  # Новое поле: скам по вине сотрудника
+    # ПЕРЕВОДЫ
+    dokidka_amount = db.Column(db.Numeric(15, 2), default=0)  # Новое поле: докидка (внешний перевод)
+    internal_transfer_amount = db.Column(db.Numeric(15, 2), default=0)  # Новое поле: внутренний перевод
+    dokidka_comment = db.Column(db.Text, default='')
+    internal_transfer_comment = db.Column(db.Text, default='')
+    # Файлы выгрузки
+    bybit_file = db.Column(db.String(255), default=None)  # путь к файлу выгрузки Bybit
+    htx_file = db.Column(db.String(255), default=None)    # путь к файлу выгрузки HTX
+    bliss_file = db.Column(db.String(255), default=None)  # путь к файлу выгрузки Bliss
+    # Фотографии
+    start_photo = db.Column(db.String(255), default=None) # фото начала смены
+    end_photo = db.Column(db.String(255), default=None)   # фото конца смены
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    bybit_requests = db.Column(db.Integer, default=0)
+    htx_requests = db.Column(db.Integer, default=0)
+    bliss_requests = db.Column(db.Integer, default=0)
+    # Новые поля для дат сделок по площадкам
+    bybit_first_trade = db.Column(db.String(100), default='')
+    bybit_last_trade = db.Column(db.String(100), default='')
+    htx_first_trade = db.Column(db.String(100), default='')
+    htx_last_trade = db.Column(db.String(100), default='')
+    bliss_first_trade = db.Column(db.String(100), default='')
+    bliss_last_trade = db.Column(db.String(100), default='')
+    gate_first_trade = db.Column(db.String(100), default='')
+    gate_last_trade = db.Column(db.String(100), default='')
+    appeal_amount = db.Column(db.Numeric(15, 2), default=0)
+    appeal_comment = db.Column(db.Text, default='')
+
+class OrderDetail(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    shift_report_id = db.Column(db.Integer, db.ForeignKey('shift_report.id'), nullable=False)
+    order_id = db.Column(db.String(100), nullable=False)
+    symbol = db.Column(db.String(20), nullable=False)
+    side = db.Column(db.String(10), nullable=False)  # 'buy' или 'sell'
+    quantity = db.Column(db.Numeric(15, 8), nullable=False)
+    price = db.Column(db.Numeric(15, 8), nullable=False)
+    total_usdt = db.Column(db.Numeric(15, 2), nullable=False)
+    fees_usdt = db.Column(db.Numeric(15, 2), default=0)
+    status = db.Column(db.String(20), nullable=False)  # 'success', 'failed', 'pending'
+    executed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class InitialBalance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    platform = db.Column(db.String(20), nullable=False)
+    account_name = db.Column(db.String(100), nullable=False)
+    balance = db.Column(db.Numeric(15, 2), nullable=False, default=0)
+
+class AccountBalanceHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    account_id = db.Column(db.Integer, db.ForeignKey('account.id'), nullable=False)
+    account_name = db.Column(db.String(100), nullable=False)
+    platform = db.Column(db.String(20), nullable=False)
+    shift_date = db.Column(db.Date, nullable=False)
+    shift_type = db.Column(db.String(20), nullable=False)
+    balance = db.Column(db.Numeric(15, 2), nullable=False)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=True)
+    employee_name = db.Column(db.String(100), nullable=True)
+    balance_type = db.Column(db.String(10), nullable=False, default='end')  # start или end
+
+# API Endpoints
+@app.route('/')
+def index():
+    return send_from_directory('templates', 'index.html')
+
+@app.route('/api/employees', methods=['GET'])
+def get_employees():
+    employees = Employee.query.all()
+    return jsonify([
+        {
+            'id': e.id,
+            'name': e.name,
+            'telegram': e.telegram,
+            'created_at': e.created_at,
+            'salary_percent': e.salary_percent
+        } for e in employees
+    ])
+
+@app.route('/api/employees', methods=['POST'])
+def create_employee():
+    """Создаёт нового сотрудника. Ожидает JSON с полями name и telegram."""
+    try:
+        # Валидация входных данных
+        data = request.json
+        if not data or not data.get('name') or not data.get('telegram'):
+            return jsonify({'error': 'Необходимо указать имя и telegram'}), 400
+        employee = Employee(
+            name=data['name'],
+            telegram=data['telegram']
+        )
+        db.session.add(employee)
+        db.session.commit()
+        return jsonify({'id': employee.id, 'message': 'Employee created successfully'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка при создании сотрудника: {str(e)}'}), 500
+
+@app.route('/api/employees/<int:employee_id>', methods=['DELETE'])
+def delete_employee(employee_id):
+    """Удаляет сотрудника по id. Требует пароль администратора в JSON."""
+    try:
+        data = request.get_json()
+        if not validate_admin_password(data):
+            return jsonify({'error': 'Неверный пароль'}), 403
+        employee = db.session.get(Employee, employee_id)
+        if not employee:
+            return jsonify({'error': 'Сотрудник не найден'}), 404
+        db.session.delete(employee)
+        db.session.commit()
+        return jsonify({'message': 'Сотрудник удален'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка при удалении сотрудника: {str(e)}'}), 500
+
+@app.route('/api/employees/<int:employee_id>', methods=['PUT'])
+def update_employee(employee_id):
+    data = request.json
+    emp = Employee.query.get(employee_id)
+    if not emp:
+        return jsonify({'error': 'Employee not found'}), 404
+    if 'name' in data:
+        emp.name = data['name']
+    if 'telegram' in data:
+        emp.telegram = data['telegram']
+    if 'salary_percent' in data:
+        try:
+            emp.salary_percent = float(data['salary_percent'])
+        except Exception:
+            return jsonify({'error': 'Invalid salary_percent'}), 400
+    db.session.commit()
+    return jsonify({'message': 'Employee updated'})
+
+@app.route('/api/accounts', methods=['GET'])
+def get_accounts():
+    accounts = Account.query.filter_by(is_active=True).all()
+    return jsonify([{
+        'id': a.id,
+        'employee_id': a.employee_id,
+        'platform': a.platform,
+        'account_name': a.account_name
+    } for a in accounts])
+
+@app.route('/api/accounts', methods=['POST'])
+def create_account():
+    """Создаёт новый аккаунт. Ожидает JSON с platform и account_name."""
+    try:
+        # Валидация входных данных
+        data = request.json
+        if not data or not data.get('platform') or not data.get('account_name'):
+            return jsonify({'error': 'Необходимо указать platform и account_name'}), 400
+        account = Account(
+            platform=data['platform'],
+            account_name=data['account_name']
+        )
+        db.session.add(account)
+        db.session.commit()
+        return jsonify({'id': account.id, 'message': 'Account created successfully'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка при создании аккаунта: {str(e)}'}), 500
+
+@app.route('/api/accounts/<int:account_id>', methods=['DELETE'])
+def delete_account(account_id):
+    """Удаляет аккаунт по id. Требует пароль администратора в JSON."""
+    try:
+        data = request.get_json()
+        if not validate_admin_password(data):
+            return jsonify({'error': 'Неверный пароль'}), 403
+        account = db.session.get(Account, account_id)
+        if not account:
+            return jsonify({'error': 'Аккаунт не найден'}), 404
+        db.session.delete(account)
+        db.session.commit()
+        return jsonify({'message': 'Аккаунт удален'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка при удалении аккаунта: {str(e)}'}), 500
+
+@app.route('/api/reports', methods=['GET'])
+def get_reports():
+    """Возвращает список всех сменных отчётов с фильтрами по дате и сотруднику."""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    employee_id = request.args.get('employee_id')
+    
+    query = ShiftReport.query
+    
+    if start_date:
+        query = query.filter(ShiftReport.shift_date >= datetime.strptime(start_date, '%Y-%m-%d').date())
+    if end_date:
+        query = query.filter(ShiftReport.shift_date <= datetime.strptime(end_date, '%Y-%m-%d').date())
+    if employee_id:
+        query = query.filter(ShiftReport.employee_id == int(employee_id))
+    
+    reports = query.all()
+    return jsonify([{
+        'id': r.id,
+        'employee_id': r.employee_id,
+        'shift_date': r.shift_date.isoformat(),
+        'shift_type': r.shift_type,
+        'total_requests': r.total_requests,
+        'balances_json': r.balances_json,
+        'scam_amount': float(r.scam_amount),
+        'scam_comment': r.scam_comment,
+        'scam_personal': r.scam_personal,
+        'dokidka_amount': float(r.dokidka_amount),
+        'dokidka_comment': r.dokidka_comment,
+        'internal_transfer_amount': float(r.internal_transfer_amount),
+        'internal_transfer_comment': r.internal_transfer_comment,
+        'bybit_file': r.bybit_file,
+        'htx_file': r.htx_file,
+        'bliss_file': r.bliss_file,
+        'start_photo': r.start_photo,
+        'end_photo': r.end_photo,
+        'bybit_requests': r.bybit_requests,
+        'htx_requests': r.htx_requests,
+        'bliss_requests': r.bliss_requests,
+        'bybit_first_trade': r.bybit_first_trade,
+        'bybit_last_trade': r.bybit_last_trade,
+        'htx_first_trade': r.htx_first_trade,
+        'htx_last_trade': r.htx_last_trade,
+        'bliss_first_trade': r.bliss_first_trade,
+        'bliss_last_trade': r.bliss_last_trade,
+        'gate_first_trade': r.gate_first_trade,
+        'gate_last_trade': r.gate_last_trade,
+        'appeal_amount': float(getattr(r, 'appeal_amount', 0) or 0),
+        'appeal_comment': getattr(r, 'appeal_comment', '')
+    } for r in reports])
+
+def parse_bool(value):
+    """Преобразует строковое значение в булево"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', '1', 'yes', 'on')
+    return bool(value)
+
+@app.route('/api/reports', methods=['POST'])
+def create_report():
+    """Создаёт сменный отчёт. Ожидает JSON или multipart/form-data с основными полями смены и файлами."""
+    try:
+        # Валидация и обработка данных/файлов
+        if request.content_type and request.content_type.startswith('multipart/form-data'):
+            form = request.form
+            files = request.files
+            
+            # Валидация обязательных полей
+            required_fields = ['employee_id', 'shift_date', 'shift_type']
+            for field in required_fields:
+                if not form.get(field):
+                    return jsonify({'error': f'Поле {field} обязательно для заполнения'}), 400
+            
+            # Сохраняем файлы выгрузок и фото с валидацией
+            file_keys = ['bybit_file', 'htx_file', 'bliss_file', 'start_photo', 'end_photo']
+            file_paths = {}
+            
+            for key in file_keys:
+                file = files.get(key)
+                if file and file.filename:
+                    if not allowed_file(file.filename):
+                        return jsonify({'error': f'Недопустимый тип файла: {file.filename}'}), 400
+                    
+                    if not validate_file_size(file):
+                        return jsonify({'error': f'Файл {file.filename} слишком большой'}), 400
+                    
+                    filename = secure_filename(file.filename)
+                    # Добавляем timestamp для уникальности
+                    name, ext = os.path.splitext(filename)
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    filename = f"{name}_{timestamp}{ext}"
+                    
+                    save_path = os.path.join(UPLOAD_FOLDER, filename)
+                    file.save(save_path)
+                    file_paths[key] = f"/uploads/{filename}"
+                else:
+                    file_paths[key] = None
+
+            # Валидация числовых полей
+            try:
+                bybit_requests = int(form.get('bybit_requests', 0))
+                htx_requests = int(form.get('htx_requests', 0))
+                bliss_requests = int(form.get('bliss_requests', 0))
+                if any(x < 0 for x in [bybit_requests, htx_requests, bliss_requests]):
+                    return jsonify({'error': 'Количество заявок не может быть отрицательным'}), 400
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Неверный формат числовых данных'}), 400
+
+            # Валидация JSON балансов
+            try:
+                balances_json = form.get('balances_json', '{}')
+                json.loads(balances_json)  # Проверяем корректность JSON
+            except json.JSONDecodeError:
+                return jsonify({'error': 'Неверный формат JSON балансов'}), 400
+
+            total_requests = bybit_requests + htx_requests + bliss_requests
+
+            report = ShiftReport(
+                employee_id=form['employee_id'],
+                shift_date=datetime.strptime(form['shift_date'], '%Y-%m-%d').date(),
+                shift_type=form['shift_type'],
+                total_requests=total_requests,
+                balances_json=balances_json,
+                scam_amount=form.get('scam_amount', 0),
+                scam_comment=form.get('scam_comment', ''),
+                scam_personal=parse_bool(form.get('scam_personal', False)),
+                dokidka_amount=form.get('dokidka_amount', 0),
+                dokidka_comment=form.get('dokidka_comment', ''),
+                internal_transfer_amount=form.get('internal_transfer_amount', 0),
+                internal_transfer_comment=form.get('internal_transfer_comment', ''),
+                bybit_file=file_paths['bybit_file'],
+                htx_file=file_paths['htx_file'],
+                bliss_file=file_paths['bliss_file'],
+                start_photo=file_paths['start_photo'],
+                end_photo=file_paths['end_photo'],
+                bybit_requests=bybit_requests,
+                htx_requests=htx_requests,
+                bliss_requests=bliss_requests,
+                bybit_first_trade=form.get('bybit_first_trade', ''),
+                bybit_last_trade=form.get('bybit_last_trade', ''),
+                htx_first_trade=form.get('htx_first_trade', ''),
+                htx_last_trade=form.get('htx_last_trade', ''),
+                bliss_first_trade=form.get('bliss_first_trade', ''),
+                bliss_last_trade=form.get('bliss_last_trade', ''),
+                gate_first_trade=form.get('gate_first_trade', ''),
+                gate_last_trade=form.get('gate_last_trade', ''),
+                appeal_amount=form.get('appeal_amount', 0),
+                appeal_comment=form.get('appeal_comment', '')
+            )
+            db.session.add(report)
+            db.session.commit()
+
+            return jsonify({'id': report.id, 'message': 'Report created successfully'})
+            
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка валидации данных: {str(e)}'}), 400
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'Ошибка при создании отчета: {str(e)}')
+        return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+
+@app.route('/api/reports/<int:report_id>', methods=['DELETE'])
+def delete_report(report_id):
+    """Удаляет сменный отчёт по id. Требует пароль администратора в JSON."""
+    try:
+        data = request.get_json()
+        if not validate_admin_password(data):
+            return jsonify({'error': 'Неверный пароль'}), 403
+        report = db.session.get(ShiftReport, report_id)
+        if not report:
+            return jsonify({'error': 'Отчет не найден'}), 404
+        db.session.delete(report)
+        db.session.commit()
+        return jsonify({'message': 'Отчет удален'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка при удалении отчета: {str(e)}'}), 500
+
+def calculate_employee_stats(reports, employees, db):
+    """Вычисляет статистику по сотрудникам для дашборда (кол-во заявок, прибыль и т.д.)."""
+    stats = []
+    for emp in employees:
+        emp_reports = [r for r in reports if r.employee_id == emp.id]
+        emp_requests = sum((r.bybit_requests or 0) + (r.htx_requests or 0) + (r.bliss_requests or 0) for r in emp_reports)
+        emp_salary_profit = sum(calculate_report_profit(db.session, r)['salary_profit'] for r in emp_reports)
+        emp_shifts = len(emp_reports)
+        avg_profit_per_shift = emp_salary_profit / emp_shifts if emp_shifts else 0
+        stats.append({
+            'id': emp.id,
+            'name': emp.name,
+            'telegram': emp.telegram,
+            'total_requests': emp_requests,
+            'net_profit': round(emp_salary_profit,2),
+            'total_shifts': emp_shifts,
+            'avg_profit_per_shift': round(avg_profit_per_shift,2)
+        })
+    return stats
+
+def calculate_last_reports(db, last_reports_query):
+    """Формирует список последних смен с расчетом прибыли и балансов по площадкам для дашборда."""
+    last_reports = []
+    for r in last_reports_query:
+        profit_data = calculate_report_profit(db.session, r)
+        try:
+            balances = json.loads(r.balances_json or '{}')
+        except json.JSONDecodeError:
+            balances = {}
+        emp = db.session.get(Employee, r.employee_id)
+        employee_name = emp.name if emp else '—'
+        platform_stats = {}
+        for platform in ['bybit','htx','bliss','gate']:
+            accounts_list = balances.get(platform, [])
+            count = len(accounts_list)
+            sum_delta = 0
+            for acc in accounts_list:
+                prev = find_prev_balance(db.session, acc.get('account_id') or acc.get('id'), platform, r)
+                cur = float(acc.get('balance', 0)) if acc.get('balance') not in (None, '') else 0
+                sum_delta += cur - prev
+            platform_stats[platform] = {'count': count, 'delta': round(sum_delta,2)}
+        profit = sum(platform_stats[p]['delta'] for p in platform_stats)
+        scam = float(r.scam_amount or 0)
+        transfer = float(r.dokidka_amount or 0)
+        net_profit = profit - scam - transfer
+        last_reports.append({
+            'id': r.id,
+            'employee_name': employee_name,
+            'shift_date': r.shift_date.isoformat(),
+            'shift_type': r.shift_type,
+            'total_requests': r.total_requests,
+            'profit': round(net_profit,2),
+            'bybit_accounts': platform_stats['bybit']['count'],
+            'bybit_delta': platform_stats['bybit']['delta'],
+            'htx_accounts': platform_stats['htx']['count'],
+            'htx_delta': platform_stats['htx']['delta'],
+            'bliss_accounts': platform_stats['bliss']['count'],
+            'bliss_delta': platform_stats['bliss']['delta'],
+            'gate_accounts': platform_stats['gate']['count'],
+            'gate_delta': platform_stats['gate']['delta'],
+        })
+    return last_reports
+
+def calculate_account_balances(accounts, reports, db):
+    """Вычисляет финальные балансы по всем аккаунтам для дашборда."""
+    account_balances = {}
+    for acc in accounts:
+        account_balances[acc.id] = calculate_account_last_balance(db.session, acc.id, acc.platform, reports)
+    return account_balances
+
+@app.route('/api/dashboard', methods=['GET'])
+def get_dashboard_data():
+    """Возвращает агрегированные данные для дашборда с поддержкой фильтрации по дате. Топ-3 сотрудников и общая прибыль всегда за текущий месяц."""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    if start_date and end_date:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    else:
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=30)
+    reports = ShiftReport.query.filter(
+        ShiftReport.shift_date >= start_date,
+        ShiftReport.shift_date <= end_date
+    ).all()
+    # --- Общая прибыль за выбранный период (оставляем для других целей) ---
+    total_profit = sum(calculate_report_profit(db.session, r)['salary_profit'] for r in reports)
+    # --- Общий объем: сумма всех end_balance по всем аккаунтам на конец последней смены ---
+    accounts = Account.query.filter_by(is_active=True).all()
+    last_report = max(reports, key=lambda r: (r.shift_date, 0 if r.shift_type=='morning' else 1), default=None)
+    total_volume = 0.0
+    if last_report:
+        try:
+            balances = json.loads(last_report.balances_json or '{}')
+        except:
+            balances = {}
+        for platform in ['bybit','htx','bliss','gate']:
+            if balances.get(platform):
+                for acc in balances[platform]:
+                    end = float(acc.get('end_balance', 0) or 0)
+                    total_volume += end
+    total_requests = sum((r.bybit_requests or 0) + (r.htx_requests or 0) + (r.bliss_requests or 0) for r in reports)
+    morning_profit = 0
+    evening_profit = 0
+    reports_with_net = []
+    for r in reports:
+        profit_data = calculate_report_profit(db.session, r)
+        net_profit = profit_data['project_profit']
+        if r.shift_type == 'morning':
+            morning_profit += net_profit
+        elif r.shift_type == 'evening':
+            evening_profit += net_profit
+        reports_with_net.append({
+            'id': r.id,
+            'employee_id': r.employee_id,
+            'shift_date': r.shift_date.isoformat(),
+            'shift_type': r.shift_type,
+            'total_requests': r.total_requests,
+            'balances_json': r.balances_json,
+            'scam_amount': float(r.scam_amount),
+            'scam_comment': r.scam_comment,
+            'scam_personal': r.scam_personal,
+            'dokidka_amount': float(r.dokidka_amount),
+            'dokidka_comment': r.dokidka_comment,
+            'internal_transfer_amount': float(r.internal_transfer_amount),
+            'internal_transfer_comment': r.internal_transfer_comment,
+            'bybit_file': r.bybit_file,
+            'htx_file': r.htx_file,
+            'bliss_file': r.bliss_file,
+            'start_photo': r.start_photo,
+            'end_photo': r.end_photo,
+            'bybit_requests': r.bybit_requests,
+            'htx_requests': r.htx_requests,
+            'bliss_requests': r.bliss_requests,
+            'net_profit': round(net_profit, 2)
+        })
+    # --- Статистика по сотрудникам (ТОП-3) и общая прибыль всегда за текущий календарный месяц ---
+    today = datetime.now().date()
+    month_start = today.replace(day=1)
+    month_end = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    month_reports = ShiftReport.query.filter(
+        ShiftReport.shift_date >= month_start,
+        ShiftReport.shift_date <= month_end
+    ).all()
+    employees = Employee.query.filter_by(is_active=True).all()
+    employee_stats = calculate_employee_stats(month_reports, employees, db)
+    month_total_profit = sum(calculate_report_profit(db.session, r)['salary_profit'] for r in month_reports)
+    month_total_requests = sum((r.bybit_requests or 0) + (r.htx_requests or 0) + (r.bliss_requests or 0) for r in month_reports)
+    # --- LAST REPORTS (3 последних смены) ---
+    last_reports_query = ShiftReport.query.order_by(ShiftReport.shift_date.desc(), ShiftReport.shift_type.desc()).limit(3).all()
+    last_reports = calculate_last_reports(db, last_reports_query)
+    dashboard = {
+        'total_profit': round(total_profit,2),
+        'month_total_profit': round(month_total_profit,2),
+        'total_volume': round(total_volume,2),
+        'total_requests': total_requests,
+        'month_total_requests': month_total_requests,
+        'morning_profit': round(morning_profit,2),
+        'evening_profit': round(evening_profit,2),
+        'employee_stats': employee_stats,
+        'last_reports': last_reports,
+        'reports': reports_with_net,
+        'profit_by_day': group_reports_by_day_net_profit(reports_with_net)
+    }
+    return jsonify(dashboard)
+
+@app.route('/api/settings/balances', methods=['GET', 'POST'])
+def settings_balances():
+    """Получение и сохранение начальных балансов. POST требует пароль администратора."""
+    if request.method == 'GET':
+        # Возвращаем все начальные балансы
+        balances = InitialBalance.query.all()
+        return jsonify([
+            {'id': b.id, 'platform': b.platform, 'account_name': b.account_name, 'balance': float(b.balance)}
+            for b in balances
+        ])
+    elif request.method == 'POST':
+        try:
+            data = request.json
+            if not validate_admin_password(data):
+                return jsonify({'error': 'Неверный пароль'}), 403
+            # Ожидаем список балансов: [{platform, account_name, balance}]
+            if not data.get('balances') or not isinstance(data['balances'], list):
+                return jsonify({'error': 'Необходимо передать список balances'}), 400
+            InitialBalance.query.delete()
+            for item in data.get('balances', []):
+                if not item.get('platform') or not item.get('account_name'):
+                    return jsonify({'error': 'Каждый баланс должен содержать platform и account_name'}), 400
+                b = InitialBalance(
+                    platform=item['platform'],
+                    account_name=item['account_name'],
+                    balance=item['balance']
+                )
+                db.session.add(b)
+            db.session.commit()
+            return jsonify({'message': 'Начальные балансы сохранены'})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'error': f'Ошибка при сохранении балансов: {str(e)}'}), 500
+
+def calculate_employee_statistics(reports, emp, db):
+    """Вычисляет подробную статистику по одному сотруднику для /api/statistics (смены, заявки, прибыль, скам, переводы, зарплата и т.д.)."""
+    if not reports:
+        return {
+            'id': emp.id,
+            'name': emp.name,
+            'telegram': emp.telegram,
+            'total_days': 0,
+            'total_shifts': 0,
+            'total_requests': 0,
+            'avg_requests_per_day': 0,
+            'total_profit': 0,
+            'net_profit': 0,
+            'salary': 0,
+            'total_scam': 0,
+            'total_transfer': 0,
+            'avg_profit_per_shift': 0,
+            'total_bybit': 0,
+            'total_htx': 0,
+            'total_bliss': 0
+        }
+    total_requests = sum((r.bybit_requests or 0) + (r.htx_requests or 0) + (r.bliss_requests or 0) for r in reports)
+    total_bybit = sum(r.bybit_requests or 0 for r in reports)
+    total_htx = sum(r.htx_requests or 0 for r in reports)
+    total_bliss = sum(r.bliss_requests or 0 for r in reports)
+    # Считаем только скамы по вине сотрудника
+    total_scam = float(sum(r.scam_amount or 0 for r in reports if getattr(r, 'scam_personal', False)))
+    total_transfer = float(sum(r.dokidka_amount or 0 for r in reports))
+    # Считаем прибыль по новой логике
+    total_project_profit = sum(calculate_report_profit(db.session, r)['project_profit'] for r in reports)
+    total_salary_profit = sum(calculate_report_profit(db.session, r)['salary_profit'] for r in reports)
+    # Используем индивидуальный процент сотрудника, если задан, иначе 30%
+    salary_percent = emp.salary_percent if emp.salary_percent is not None else 30.0
+    salary = max(0, total_salary_profit * (salary_percent / 100))
+    total_shifts = len(reports)
+    total_days = len(set(r.shift_date for r in reports))
+    avg_requests_per_day = total_requests / total_days if total_days else 0
+    avg_profit_per_shift = total_salary_profit / total_shifts if total_shifts else 0
+    return {
+        'id': emp.id,
+        'name': emp.name,
+        'telegram': emp.telegram,
+        'total_days': total_days,
+        'total_shifts': total_shifts,
+        'total_requests': total_requests,
+        'total_bybit': total_bybit,
+        'total_htx': total_htx,
+        'total_bliss': total_bliss,
+        'avg_requests_per_day': round(avg_requests_per_day,2),
+        'total_profit': round(total_project_profit,2),
+        'net_profit': round(total_salary_profit,2),
+        'salary': round(salary,2),
+        'total_scam': round(total_scam,2),
+        'total_transfer': round(total_transfer,2),
+        'avg_profit_per_shift': round(avg_profit_per_shift,2)
+    }
+
+@app.route('/api/statistics', methods=['GET'])
+def statistics():
+    """Возвращает подробную статистику по сотрудникам за выбранный период: смены, заявки, прибыль, скам, переводы, зарплата и т.д."""
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    if not start_date or not end_date:
+        today = datetime.now().date()
+        start_date = today.replace(day=1)
+        end_date = today
+    else:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    employees = Employee.query.filter_by(is_active=True).all()
+    stats = []
+    for emp in employees:
+        reports = ShiftReport.query.filter(
+            ShiftReport.employee_id == emp.id,
+            ShiftReport.shift_date >= start_date,
+            ShiftReport.shift_date <= end_date
+        ).all()
+        stats.append(calculate_employee_statistics(reports, emp, db))
+    return jsonify(stats)
+
+@app.route('/logout')
+def logout():
+    """Endpoint для выхода из системы"""
+    # В данном случае просто перенаправляем на главную страницу
+    # В реальном приложении здесь можно добавить очистку сессии
+    return jsonify({'message': 'Выход выполнен успешно', 'redirect': '/'})
+
+@app.route('/api/account-balance-history', methods=['GET'])
+def get_account_balance_history():
+    """Возвращает историю балансов аккаунтов с фильтрами."""
+    query = AccountBalanceHistory.query
+    account_id = request.args.get('account_id')
+    platform = request.args.get('platform')
+    employee_id = request.args.get('employee_id')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    if account_id:
+        query = query.filter(AccountBalanceHistory.account_id == int(account_id))
+    if platform:
+        query = query.filter(AccountBalanceHistory.platform == platform)
+    if employee_id:
+        query = query.filter(AccountBalanceHistory.employee_id == int(employee_id))
+    if start_date:
+        query = query.filter(AccountBalanceHistory.shift_date >= datetime.strptime(start_date, '%Y-%m-%d').date())
+    if end_date:
+        query = query.filter(AccountBalanceHistory.shift_date <= datetime.strptime(end_date, '%Y-%m-%d').date())
+    history = query.order_by(AccountBalanceHistory.shift_date, AccountBalanceHistory.shift_type).all()
+    return jsonify([
+        {
+            'id': h.id,
+            'account_id': h.account_id,
+            'account_name': h.account_name,
+            'platform': h.platform,
+            'shift_date': h.shift_date.isoformat(),
+            'shift_type': h.shift_type,
+            'balance': float(h.balance),
+            'employee_id': h.employee_id,
+            'employee_name': h.employee_name,
+            'balance_type': h.balance_type
+        }
+        for h in history
+    ])
+
+@app.route('/api/account-balance-history', methods=['POST'])
+def add_account_balance_history():
+    """Добавляет запись в историю балансов аккаунтов."""
+    try:
+        data = request.json
+        if not data or not data.get('account_id') or not data.get('platform') or not data.get('shift_date') or not data.get('shift_type'):
+            return jsonify({'error': 'Необходимо указать account_id, platform, shift_date, shift_type'}), 400
+        history = AccountBalanceHistory(
+            account_id=data['account_id'],
+            account_name=data.get('account_name', ''),
+            platform=data['platform'],
+            shift_date=datetime.strptime(data['shift_date'], '%Y-%m-%d').date(),
+            shift_type=data['shift_type'],
+            balance=data.get('balance', 0),
+            employee_id=data.get('employee_id'),
+            employee_name=data.get('employee_name', ''),
+            balance_type=data.get('balance_type', 'end')
+        )
+        db.session.add(history)
+        db.session.commit()
+        return jsonify({'id': history.id, 'message': 'Account balance history added'})
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': f'Ошибка валидации данных: {str(e)}'}), 400
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'Ошибка при добавлении в историю балансов: {str(e)}')
+        return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+
+# Добавляю новые API endpoints для безопасной аутентификации
+@app.route('/api/auth/login', methods=['POST'])
+def api_login():
+    """API endpoint для аутентификации пользователей"""
+    try:
+        data = request.json
+        if not data or not data.get('password'):
+            return jsonify({'error': 'Пароль обязателен'}), 400
+        
+        # Проверяем пароль приложения
+        app_password = os.environ.get('APP_PASSWORD', '7605203')
+        if data['password'] == app_password:
+            return jsonify({'success': True, 'message': 'Аутентификация успешна'})
+        else:
+            return jsonify({'error': 'Неверный пароль'}), 401
+    except Exception as e:
+        app.logger.error(f'Ошибка аутентификации: {str(e)}')
+        return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+
+@app.route('/api/auth/admin', methods=['POST'])
+def api_admin_login():
+    """API endpoint для аутентификации администратора"""
+    try:
+        data = request.json
+        if not data or not data.get('password'):
+            return jsonify({'error': 'Пароль обязателен'}), 400
+        
+        # Проверяем пароль администратора
+        admin_password = os.environ.get('ADMIN_PASSWORD', 'Blalala2')
+        if data['password'] == admin_password:
+            return jsonify({'success': True, 'message': 'Аутентификация администратора успешна'})
+        else:
+            return jsonify({'error': 'Неверный пароль администратора'}), 401
+    except Exception as e:
+        app.logger.error(f'Ошибка аутентификации администратора: {str(e)}')
+        return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        
+        # Добавляем индексы для оптимизации производительности
+        try:
+            # Индексы для частых запросов
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_shift_report_date ON shift_report(shift_date)')
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_shift_report_employee ON shift_report(employee_id)')
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_shift_report_date_employee ON shift_report(shift_date, employee_id)')
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_account_platform ON account(platform)')
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_account_employee ON account(employee_id)')
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_balance_history_date ON account_balance_history(shift_date)')
+            db.engine.execute('CREATE INDEX IF NOT EXISTS idx_balance_history_account ON account_balance_history(account_id)')
+            app.logger.info('Индексы базы данных созданы успешно')
+        except Exception as e:
+            app.logger.warning(f'Ошибка при создании индексов: {str(e)}')
+    
+    # Настройки для продакшена
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    host = os.environ.get('FLASK_HOST', '127.0.0.1')
+    port = int(os.environ.get('FLASK_PORT', 5000))
+    
+    app.run(debug=debug_mode, host=host, port=port) 

@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Birch Team - Мониторинг P2P арбитража</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        /* Existing styles remain the same */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            color: white;
+            position: relative;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .logout-btn {
+            position: absolute;
+            top: 0;
+            right: 0;
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: all 0.3s ease;
+        }
+
+        .logout-btn:hover {
+            background: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
+        }
+
+        .nav-tabs {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .nav-tab {
+            background: rgba(255,255,255,0.1);
+            border: none;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.9em;
+            backdrop-filter: blur(10px);
+        }
+
+        .nav-tab:hover {
+            background: rgba(255,255,255,0.2);
+            transform: translateY(-2px);
+        }
+
+        .nav-tab.active {
+            background: rgba(255,255,255,0.3);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+
+        .card {
+            background: rgba(255,255,255,0.95);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }
+
+        .card h3 {
+            color: #764ba2;
+            margin-bottom: 20px;
+            font-size: 1.4em;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            transition: transform 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stat-card h4 {
+            font-size: 2em;
+            margin-bottom: 5px;
+        }
+
+        .stat-card p {
+            opacity: 0.9;
+            font-size: 0.9em;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #555;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e8ed;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: border-color 0.3s ease;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        .table th,
+        .table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e1e8ed;
+        }
+
+        .table th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #555;
+        }
+
+        .table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 50px;
+            color: white;
+        }
+
+        .loading i {
+            margin-bottom: 20px;
+        }
+
+        .error {
+            background: #fee;
+            color: #c33;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #fcc;
+        }
+
+        .success {
+            background: #efe;
+            color: #393;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #cfc;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .nav-tabs {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            .nav-tab {
+                width: 200px;
+                text-align: center;
+            }
+            
+            .card {
+                padding: 20px;
+            }
+            
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        function App() {
+            const [globalAuthed, setGlobalAuthed] = useState(false);
+            const [globalPassword, setGlobalPassword] = useState('');
+            const [globalError, setGlobalError] = useState('');
+            const [loading, setLoading] = useState(true);
+            const [activeTab, setActiveTab] = useState('dashboard');
+            const [dashboardData, setDashboardData] = useState(null);
+            const [employees, setEmployees] = useState([]);
+            const [platforms, setPlatforms] = useState([]);
+            const [reports, setReports] = useState([]);
+
+            // Settings states
+            const [settingsAuthed, setSettingsAuthed] = useState(false);
+            const [settingsPassword, setSettingsPassword] = useState('');
+            const [settingsInitialBalances, setSettingsInitialBalances] = useState([]);
+            const [settingsAccounts, setSettingsAccounts] = useState([]);
+            const [settingsLoading, setSettingsLoading] = useState(false);
+
+            // Statistics states
+            const [stats, setStats] = useState([]);
+            const [statsStart, setStatsStart] = useState(() => {
+                const today = new Date();
+                const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+                return firstDay.toISOString().slice(0, 10);
+            });
+            const [statsEnd, setStatsEnd] = useState(() => {
+                const today = new Date();
+                return today.toISOString().slice(0, 10);
+            });
+            const [statsLoading, setStatsLoading] = useState(false);
+
+            useEffect(() => {
+                const isAuthenticated = sessionStorage.getItem('authenticated') === 'true';
+                if (isAuthenticated) {
+                    setGlobalAuthed(true);
+                    loadData();
+                } else {
+                    setLoading(false);
+                }
+            }, []);
+
+            const loadData = async () => {
+                setLoading(true);
+                try {
+                    const [dashboardRes, employeesRes, accountsRes, reportsRes] = await Promise.all([
+                        fetch('/api/dashboard'),
+                        fetch('/api/employees'),
+                        fetch('/api/accounts'),
+                        fetch('/api/reports')
+                    ]);
+
+                    const [dashboard, employees, accounts, reports] = await Promise.all([
+                        dashboardRes.json(),
+                        employeesRes.json(),
+                        accountsRes.json(),
+                        reportsRes.json()
+                    ]);
+
+                    setDashboardData(dashboard);
+                    setEmployees(employees);
+                    setPlatforms(accounts);
+                    setReports(reports);
+                } catch (error) {
+                    setGlobalError('Ошибка загрузки данных');
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleLogin = async () => {
+                try {
+                    const response = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ password: globalPassword })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok && result.success) {
+                        setGlobalAuthed(true);
+                        setGlobalError('');
+                        sessionStorage.setItem('authenticated', 'true');
+                        loadData();
+                    } else {
+                        setGlobalError(result.error || 'Неверный пароль!');
+                    }
+                } catch (error) {
+                    setGlobalError('Ошибка подключения к серверу');
+                }
+            };
+
+            const handleLogout = () => {
+                setGlobalAuthed(false);
+                setGlobalPassword('');
+                setGlobalError('');
+                sessionStorage.removeItem('authenticated');
+                setDashboardData(null);
+                setEmployees([]);
+                setReports([]);
+                setLoading(true);
+            };
+
+            // Если не аутентифицирован, показываем форму входа
+            if (!globalAuthed) {
+                return (
+                    <div className="container">
+                        <div className="header">
+                            <h1><i className="fas fa-coins"></i> Birch Team</h1>
+                            <p>Мониторинг и аналитика P2P арбитражной команды</p>
+                        </div>
+                        <div className="card" style={{maxWidth: 400, margin: '40px auto', textAlign: 'center'}}>
+                            <h3><i className="fas fa-lock"></i> Вход в систему</h3>
+                            <div className="form-group">
+                                <input 
+                                    type="password" 
+                                    className="form-control" 
+                                    placeholder="Введите пароль" 
+                                    value={globalPassword} 
+                                    onChange={e => setGlobalPassword(e.target.value)}
+                                    onKeyPress={e => e.key === 'Enter' && handleLogin()}
+                                    style={{margin: '20px 0'}} 
+                                />
+                            </div>
+                            <button className="btn" onClick={handleLogin}>
+                                <i className="fas fa-sign-in-alt"></i> Войти
+                            </button>
+                            {globalError && <div style={{color: '#e74c3c', marginTop: 10}}>{globalError}</div>}
+                        </div>
+                    </div>
+                );
+            }
+
+            if (loading) {
+                return (
+                    <div className="container">
+                        <div className="loading">
+                            <i className="fas fa-spinner fa-spin fa-2x"></i>
+                            <p>Загрузка данных...</p>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="container">
+                    <div className="header">
+                        <h1><i className="fas fa-coins"></i> Birch Team</h1>
+                        <p>Мониторинг и аналитика P2P арбитражной команды</p>
+                        <button className="logout-btn" onClick={handleLogout}>
+                            <i className="fas fa-sign-out-alt"></i> Выйти
+                        </button>
+                    </div>
+
+                    <div className="nav-tabs">
+                        <div className={`nav-tab ${activeTab === 'dashboard' ? 'active' : ''}`} 
+                             onClick={() => setActiveTab('dashboard')}>
+                            <i className="fas fa-tachometer-alt"></i> Дашборд
+                        </div>
+                        <div className={`nav-tab ${activeTab === 'employees' ? 'active' : ''}`} 
+                             onClick={() => setActiveTab('employees')}>
+                            <i className="fas fa-users"></i> Сотрудники
+                        </div>
+                        <div className={`nav-tab ${activeTab === 'platforms' ? 'active' : ''}`} 
+                             onClick={() => setActiveTab('platforms')}>
+                            <i className="fas fa-exchange-alt"></i> Площадки
+                        </div>
+                        <div className={`nav-tab ${activeTab === 'reports' ? 'active' : ''}`} 
+                             onClick={() => setActiveTab('reports')}>
+                            <i className="fas fa-file-alt"></i> Отчеты
+                        </div>
+                        <div className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`} 
+                             onClick={() => setActiveTab('settings')}>
+                            <i className="fas fa-cog"></i> Настройки
+                        </div>
+                    </div>
+
+                    {activeTab === 'dashboard' && <Dashboard data={dashboardData} />}
+                    {activeTab === 'employees' && <Employees employees={employees} onUpdate={loadData} />}
+                    {activeTab === 'platforms' && <Platforms platforms={platforms} employees={employees} onUpdate={loadData} />}
+                    {activeTab === 'reports' && <Reports reports={reports} employees={employees} platforms={platforms} onUpdate={loadData} />}
+                    {activeTab === 'settings' && <Settings />}
+                </div>
+            );
+        }
+
+        function Dashboard({ data }) {
+            if (!data) {
+                return <div className="loading">Загрузка дашборда...</div>;
+            }
+
+            return (
+                <div className="card">
+                    <h3><i className="fas fa-tachometer-alt"></i> Дашборд</h3>
+                    <div className="stats-grid">
+                        <div className="stat-card">
+                            <h4>{data.total_profit || 0} USDT</h4>
+                            <p>Общая прибыль</p>
+                        </div>
+                        <div className="stat-card">
+                            <h4>{data.total_volume || 0} USDT</h4>
+                            <p>Общий объем</p>
+                        </div>
+                        <div className="stat-card">
+                            <h4>{data.total_requests || 0}</h4>
+                            <p>Всего заявок</p>
+                        </div>
+                        <div className="stat-card">
+                            <h4>{data.employee_stats?.length || 0}</h4>
+                            <p>Активных сотрудников</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function Employees({ employees, onUpdate }) {
+            const [newEmployee, setNewEmployee] = useState({ name: '', telegram: '' });
+            const [error, setError] = useState('');
+            const [success, setSuccess] = useState('');
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!newEmployee.name || !newEmployee.telegram) {
+                    setError('Заполните все поля');
+                    return;
+                }
+
+                try {
+                    const response = await fetch('/api/employees', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(newEmployee)
+                    });
+
+                    if (response.ok) {
+                        setSuccess('Сотрудник добавлен успешно');
+                        setNewEmployee({ name: '', telegram: '' });
+                        setError('');
+                        onUpdate();
+                    } else {
+                        const result = await response.json();
+                        setError(result.error || 'Ошибка при добавлении');
+                    }
+                } catch (error) {
+                    setError('Ошибка подключения к серверу');
+                }
+            };
+
+            return (
+                <div className="card">
+                    <h3><i className="fas fa-users"></i> Управление сотрудниками</h3>
+                    
+                    <form onSubmit={handleSubmit}>
+                        <div className="form-group">
+                            <label>Имя сотрудника</label>
+                            <input 
+                                type="text" 
+                                className="form-control" 
+                                value={newEmployee.name}
+                                onChange={e => setNewEmployee({...newEmployee, name: e.target.value})}
+                                placeholder="Введите имя"
+                            />
+                        </div>
+                        <div className="form-group">
+                            <label>Telegram</label>
+                            <input 
+                                type="text" 
+                                className="form-control" 
+                                value={newEmployee.telegram}
+                                onChange={e => setNewEmployee({...newEmployee, telegram: e.target.value})}
+                                placeholder="@username"
+                            />
+                        </div>
+                        <button type="submit" className="btn">
+                            <i className="fas fa-plus"></i> Добавить сотрудника
+                        </button>
+                    </form>
+
+                    {error && <div className="error">{error}</div>}
+                    {success && <div className="success">{success}</div>}
+
+                    <table className="table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Имя</th>
+                                <th>Telegram</th>
+                                <th>Дата создания</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {employees.map(emp => (
+                                <tr key={emp.id}>
+                                    <td>{emp.id}</td>
+                                    <td>{emp.name}</td>
+                                    <td>{emp.telegram}</td>
+                                    <td>{new Date(emp.created_at).toLocaleDateString()}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            );
+        }
+
+        function Platforms({ platforms, employees, onUpdate }) {
+            return (
+                <div className="card">
+                    <h3><i className="fas fa-exchange-alt"></i> Торговые площадки</h3>
+                    <p>Управление аккаунтами на торговых площадках</p>
+                    
+                    <table className="table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Площадка</th>
+                                <th>Название аккаунта</th>
+                                <th>Сотрудник</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {platforms.map(platform => (
+                                <tr key={platform.id}>
+                                    <td>{platform.id}</td>
+                                    <td>{platform.platform?.toUpperCase()}</td>
+                                    <td>{platform.account_name}</td>
+                                    <td>{employees.find(e => e.id === platform.employee_id)?.name || 'Не назначен'}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            );
+        }
+
+        function Reports({ reports, employees, platforms, onUpdate }) {
+            return (
+                <div className="card">
+                    <h3><i className="fas fa-file-alt"></i> Отчеты по сменам</h3>
+                    <p>Просмотр и управление сменными отчетами</p>
+                    
+                    <table className="table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Сотрудник</th>
+                                <th>Дата смены</th>
+                                <th>Тип смены</th>
+                                <th>Всего заявок</th>
+                                <th>Скам</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {reports.map(report => (
+                                <tr key={report.id}>
+                                    <td>{report.id}</td>
+                                    <td>{employees.find(e => e.id === report.employee_id)?.name || 'Неизвестен'}</td>
+                                    <td>{new Date(report.shift_date).toLocaleDateString()}</td>
+                                    <td>{report.shift_type === 'morning' ? 'Утро' : 'Вечер'}</td>
+                                    <td>{report.total_requests || 0}</td>
+                                    <td>{report.scam_amount || 0} USDT</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            );
+        }
+
+        function Settings() {
+            const [authed, setAuthed] = useState(false);
+            const [password, setPassword] = useState('');
+            const [error, setError] = useState('');
+            const [success, setSuccess] = useState('');
+
+            const handleAdminLogin = async () => {
+                try {
+                    const response = await fetch('/api/auth/admin', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ password })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok && result.success) {
+                        setAuthed(true);
+                        setError('');
+                        setSuccess('Вход в настройки выполнен');
+                    } else {
+                        setError(result.error || 'Неверный пароль администратора');
+                    }
+                } catch (error) {
+                    setError('Ошибка подключения к серверу');
+                }
+            };
+
+            if (!authed) {
+                return (
+                    <div className="card" style={{maxWidth: 400, margin: '40px auto', textAlign: 'center'}}>
+                        <h3><i className="fas fa-lock"></i> Вход в настройки</h3>
+                        <div className="form-group">
+                            <input 
+                                type="password" 
+                                className="form-control" 
+                                placeholder="Пароль администратора" 
+                                value={password} 
+                                onChange={e => setPassword(e.target.value)}
+                                onKeyPress={e => e.key === 'Enter' && handleAdminLogin()}
+                                style={{margin: '20px 0'}} 
+                            />
+                        </div>
+                        <button className="btn" onClick={handleAdminLogin}>
+                            <i className="fas fa-sign-in-alt"></i> Войти
+                        </button>
+                        {error && <div style={{color: '#e74c3c', marginTop: 10}}>{error}</div>}
+                        {success && <div style={{color: '#27ae60', marginTop: 10}}>{success}</div>}
+                    </div>
+                );
+            }
+
+            return (
+                <div className="card">
+                    <h3><i className="fas fa-cog"></i> Настройки системы</h3>
+                    <p>Здесь можно настроить параметры системы</p>
+                    <div className="success">Доступ к настройкам получен</div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html> 
